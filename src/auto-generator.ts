@@ -1,7 +1,7 @@
 import _ from "lodash";
 import { ColumnDescription } from "sequelize/types";
 import { DialectOptions, FKSpec } from "./dialects/dialect-options";
-import { AutoOptions, CaseOption, Field, IndexSpec, LangOption, qNameJoin, qNameSplit, recase, Relation, TableData, TSField, singularize, pluralize } from "./types";
+import { AutoOptions, CaseOption, Field, IndexSpec, LangOption, qNameJoin, qNameSplit, recase, Relation, TableData, TSField, pluralize } from "./types";
 
 /** Generates text from each table in TableData */
 export class AutoGenerator {
@@ -22,6 +22,7 @@ export class AutoGenerator {
     additional?: any;
     schema?: string;
     singularize: boolean;
+    noAlias?: boolean;
   };
 
   constructor(tableData: TableData, dialect: DialectOptions, options: AutoOptions) {
@@ -67,9 +68,8 @@ export class AutoGenerator {
       header += sp + "static init(sequelize, DataTypes) {\n";
       header += sp + "super.init({\n";
     } else {
-      header += "const Sequelize = require('sequelize');\n";
-      header += "module.exports = function(sequelize, DataTypes) {\n";
-      header += sp + "return sequelize.define('#TABLE#', {\n";
+      header += "import { DataTypes, Model } from 'sequelize';\n";
+      header += "import { sequelize } from '../../infrastructure/db';\n";
     }
     return header;
   }
@@ -85,42 +85,32 @@ export class AutoGenerator {
       const [schemaName, tableNameOrig] = qNameSplit(table);
       const tableName = recase(this.options.caseModel, tableNameOrig, this.options.singularize);
 
-      if (this.options.lang === 'ts') {
-        const associations = this.addTypeScriptAssociationMixins(table);
-        const needed = _.keys(associations.needed).sort();
-        needed.forEach(fkTable => {
-          const set = associations.needed[fkTable];
-          const [fkSchema, fkTableName] = qNameSplit(fkTable);
-          const filename = recase(this.options.caseFile, fkTableName, this.options.singularize);
-          str += 'import type { ';
-          str += Array.from(set.values()).sort().join(', ');
-          str += ` } from './${filename}';\n`;
-        });
-
-        str += "\nexport interface #TABLE#Attributes {\n";
-        str += this.addTypeScriptFields(table, true) + "}\n\n";
-
-        const primaryKeys = this.getTypeScriptPrimaryKeys(table);
-
-        if (primaryKeys.length) {
-          str += `export type #TABLE#Pk = ${primaryKeys.map((k) => `"${recase(this.options.caseProp, k)}"`).join(' | ')};\n`;
-          str += `export type #TABLE#Id = #TABLE#[#TABLE#Pk];\n`;
-          str += "export type #TABLE#CreationAttributes = Optional<#TABLE#Attributes, #TABLE#Pk>;\n\n";
-        } else {
-          str += "export type #TABLE#CreationAttributes = #TABLE#Attributes;\n\n";
-        }
-
-        str += "export class #TABLE# extends Model<#TABLE#Attributes, #TABLE#CreationAttributes> implements #TABLE#Attributes {\n";
-        str += this.addTypeScriptFields(table, false);
-        str += "\n" + associations.str;
-        str += "\n" + this.space[1] + "static initModel(sequelize: Sequelize.Sequelize): typeof " + tableName + " {\n";
-        str += this.space[2] + tableName + ".init({\n";
+      const fields = _.keys(this.tables[table]);
+      if (_.some(fields, f => this.isTimestampField(f))) {
+        str += "import { context } from '../../services/context/context';\n";
       }
 
+      if (_.some(Object.values(this.tables[table]), f => f.type === 'JSON')) {
+        str += "import { JSONValue } from './types';\n";
+      }
+
+      str += "\nexport type #UTABLE#DB = {\n";
+      str += this.addTypeScriptFields(table, true) + "}\n";
+
+      str += "\nexport type #UTABLE#CreationDB = {\n";
+      str += this.addTypeScriptFields(table, false) + "}\n";
+
+      str += "\n";
+      str += "export type #UTABLE#Model = Model<#UTABLE#DB, #UTABLE#CreationDB> & #UTABLE#DB;\n";
+      str += "\n";
+      str += "export const #TABLE#Model = sequelize.define<#UTABLE#Model>('#TABLE#', {\n";
       str += this.addTable(table);
 
       const re = new RegExp('#TABLE#', 'g');
       str = str.replace(re, tableName);
+
+      const reu = new RegExp('#UTABLE#', 'g');
+      str = str.replace(reu, tableName[0].toUpperCase() + tableName.substr(1));
 
       text[table] = str;
     });
@@ -152,7 +142,6 @@ export class AutoGenerator {
 
     // add the table options
     str += space[1] + "}, {\n";
-    str += space[2] + "sequelize,\n";
     str += space[2] + "tableName: '" + tableNameOrig + "',\n";
 
     if (schemaName && this.dialect.hasSchema) {
@@ -166,6 +155,14 @@ export class AutoGenerator {
     str += space[2] + "timestamps: " + timestamps + ",\n";
     if (paranoid) {
       str += space[2] + "paranoid: true,\n";
+    }
+
+    if (timestamps && !fields.includes('lastModifiedAt')) {
+      str += space[2] + "updatedAt: false,\n";
+    }
+
+    if (timestamps && !fields.includes('createdAt')) {
+      str += space[2] + "createdAt: false,\n";
     }
 
     // conditionally add additional options
@@ -187,6 +184,35 @@ export class AutoGenerator {
       });
     }
 
+    this.options.noAlias = true;
+    let assoc = '';
+    this.relations
+      .forEach(rel => {
+        if (rel.isM2M) {
+          if (rel.parentModel === tableNameOrig) {
+
+            const asprop = pluralize(rel.childProp);
+            assoc += space[3] + `// (autogenerated) models.${rel.parentModel}.belongsToMany(models.${rel.childModel}, { as: '${asprop}', through: models.${rel.joinModel}, foreignKey: "${rel.parentId}", otherKey: "${rel.childId}" });\n`;
+          }
+        } else {
+          if (rel.childModel === tableNameOrig) {
+            const bAlias = (this.options.noAlias && rel.parentModel.toLowerCase() === rel.parentProp.toLowerCase()) ? '' : `as: "${rel.parentProp}", `;
+            assoc += space[3] + `// (autogenerated) models.${rel.childModel}.belongsTo(models.${rel.parentModel}, { ${bAlias}foreignKey: "${rel.parentId}"});\n`;
+          }
+
+          if (rel.parentModel === tableNameOrig) {
+            const hasRel = rel.isOne ? "hasOne" : "hasMany";
+            const hAlias = (this.options.noAlias && pluralize(rel.childModel.toLowerCase()) === rel.childProp.toLowerCase()) ? '' : `as: "${rel.childProp}", `;
+            assoc += space[3] + `// (autogenerated) models.${rel.parentModel}.${hasRel}(models.${rel.childModel}, { ${hAlias}foreignKey: "${rel.parentId}"});\n`;
+          }
+        }
+      });
+
+    str += space[2] + "// eslint-disable-next-line\n";
+    str += space[2] + "associate: models => {\n";
+    str += assoc;
+    str += space[2] + "},\n";
+
     // add indexes
     str += this.addIndexes(table);
 
@@ -200,7 +226,6 @@ export class AutoGenerator {
       str += space[1] + "return " + tableName + ";\n";
       str += space[1] + "}\n}\n";
     } else {
-      str += "};\n";
     }
     return str;
   }
@@ -210,9 +235,6 @@ export class AutoGenerator {
 
     // ignore Sequelize standard fields
     const additional = this.options.additional;
-    if (additional && (additional.timestamps !== false) && (this.isTimestampField(field) || this.isParanoidField(field))) {
-      return '';
-    }
 
     // Find foreign key
     const foreignKey = this.foreignKeys[table] && this.foreignKeys[table][field] ? this.foreignKeys[table][field] : null;
@@ -362,6 +384,10 @@ export class AutoGenerator {
       str += ",\n";
     });
 
+    if (this.isTimestampField(field)) {
+      str += space[3] + "defaultValue: () => context.timestamp,\n";
+    }
+
     if (unique) {
       const uniq = _.isString(unique) ? quoteWrapper + unique.replace(/\"/g, '\\"') + quoteWrapper : unique;
       str += space[3] + "unique: " + uniq + ",\n";
@@ -428,7 +454,6 @@ export class AutoGenerator {
   private getSqType(fieldObj: Field, attr: string): string {
     const attrValue = (fieldObj as any)[attr];
     if (!attrValue.toLowerCase) {
-      console.log("attrValue", attr, attrValue);
       return attrValue;
     }
     const type: string = attrValue.toLowerCase();
@@ -537,111 +562,30 @@ export class AutoGenerator {
     return table;
   }
 
-  private addTypeScriptAssociationMixins(table: string): Record<string, any> {
-    const sp = this.space[1];
-    const needed: Record<string, Set<String>> = {};
-    let str = '';
-
-    table = this.addSchemaForRelations(table);
-
-    this.relations.forEach(rel => {
-      if (!rel.isM2M) {
-        if (rel.childTable === table) {
-          // current table is a child that belongsTo parent
-          const pparent = _.upperFirst(rel.parentProp);
-          str += `${sp}// ${rel.childModel} belongsTo ${rel.parentModel} via ${rel.parentId}\n`;
-          str += `${sp}${rel.parentProp}!: ${rel.parentModel};\n`;
-          str += `${sp}get${pparent}!: Sequelize.BelongsToGetAssociationMixin<${rel.parentModel}>;\n`;
-          str += `${sp}set${pparent}!: Sequelize.BelongsToSetAssociationMixin<${rel.parentModel}, ${rel.parentModel}Id>;\n`;
-          str += `${sp}create${pparent}!: Sequelize.BelongsToCreateAssociationMixin<${rel.parentModel}>;\n`;
-          needed[rel.parentTable] ??= new Set();
-          needed[rel.parentTable].add(rel.parentModel);
-          needed[rel.parentTable].add(rel.parentModel + 'Id');
-        } else if (rel.parentTable === table) {
-          needed[rel.childTable] ??= new Set();
-          const pchild = _.upperFirst(rel.childProp);
-          if (rel.isOne) {
-            // const hasModelSingular = singularize(hasModel);
-            str += `${sp}// ${rel.parentModel} hasOne ${rel.childModel} via ${rel.parentId}\n`;
-            str += `${sp}${rel.childProp}!: ${rel.childModel};\n`;
-            str += `${sp}get${pchild}!: Sequelize.HasOneGetAssociationMixin<${rel.childModel}>;\n`;
-            str += `${sp}set${pchild}!: Sequelize.HasOneSetAssociationMixin<${rel.childModel}, ${rel.childModel}Id>;\n`;
-            str += `${sp}create${pchild}!: Sequelize.HasOneCreateAssociationMixin<${rel.childModel}CreationAttributes>;\n`;
-            needed[rel.childTable].add(rel.childModel);
-            needed[rel.childTable].add(`${rel.childModel}Id`);
-            needed[rel.childTable].add(`${rel.childModel}CreationAttributes`);
-          } else {
-            const hasModel = rel.childModel;
-            const sing = _.upperFirst(singularize(rel.childProp));
-            const lur = pluralize(rel.childProp);
-            const plur = _.upperFirst(lur);
-            str += `${sp}// ${rel.parentModel} hasMany ${rel.childModel} via ${rel.parentId}\n`;
-            str += `${sp}${lur}!: ${rel.childModel}[];\n`;
-            str += `${sp}get${plur}!: Sequelize.HasManyGetAssociationsMixin<${hasModel}>;\n`;
-            str += `${sp}set${plur}!: Sequelize.HasManySetAssociationsMixin<${hasModel}, ${hasModel}Id>;\n`;
-            str += `${sp}add${sing}!: Sequelize.HasManyAddAssociationMixin<${hasModel}, ${hasModel}Id>;\n`;
-            str += `${sp}add${plur}!: Sequelize.HasManyAddAssociationsMixin<${hasModel}, ${hasModel}Id>;\n`;
-            str += `${sp}create${sing}!: Sequelize.HasManyCreateAssociationMixin<${hasModel}>;\n`;
-            str += `${sp}remove${sing}!: Sequelize.HasManyRemoveAssociationMixin<${hasModel}, ${hasModel}Id>;\n`;
-            str += `${sp}remove${plur}!: Sequelize.HasManyRemoveAssociationsMixin<${hasModel}, ${hasModel}Id>;\n`;
-            str += `${sp}has${sing}!: Sequelize.HasManyHasAssociationMixin<${hasModel}, ${hasModel}Id>;\n`;
-            str += `${sp}has${plur}!: Sequelize.HasManyHasAssociationsMixin<${hasModel}, ${hasModel}Id>;\n`;
-            str += `${sp}count${plur}!: Sequelize.HasManyCountAssociationsMixin;\n`;
-            needed[rel.childTable].add(hasModel);
-            needed[rel.childTable].add(`${hasModel}Id`);
-          }
-        }
-      } else {
-        // rel.isM2M
-        if (rel.parentTable === table) {
-          // many-to-many
-          const isParent = (rel.parentTable === table);
-          const thisModel = isParent ? rel.parentModel : rel.childModel;
-          const otherModel = isParent ? rel.childModel : rel.parentModel;
-          const otherModelSingular = _.upperFirst(singularize(isParent ? rel.childProp : rel.parentProp));
-          const lotherModelPlural = pluralize(isParent ? rel.childProp : rel.parentProp);
-          const otherModelPlural = _.upperFirst(lotherModelPlural);
-          const otherTable = isParent ? rel.childTable : rel.parentTable;
-          str += `${sp}// ${thisModel} belongsToMany ${otherModel} via ${rel.parentId} and ${rel.childId}\n`;
-          str += `${sp}${lotherModelPlural}!: ${otherModel}[];\n`;
-          str += `${sp}get${otherModelPlural}!: Sequelize.BelongsToManyGetAssociationsMixin<${otherModel}>;\n`;
-          str += `${sp}set${otherModelPlural}!: Sequelize.BelongsToManySetAssociationsMixin<${otherModel}, ${otherModel}Id>;\n`;
-          str += `${sp}add${otherModelSingular}!: Sequelize.BelongsToManyAddAssociationMixin<${otherModel}, ${otherModel}Id>;\n`;
-          str += `${sp}add${otherModelPlural}!: Sequelize.BelongsToManyAddAssociationsMixin<${otherModel}, ${otherModel}Id>;\n`;
-          str += `${sp}create${otherModelSingular}!: Sequelize.BelongsToManyCreateAssociationMixin<${otherModel}>;\n`;
-          str += `${sp}remove${otherModelSingular}!: Sequelize.BelongsToManyRemoveAssociationMixin<${otherModel}, ${otherModel}Id>;\n`;
-          str += `${sp}remove${otherModelPlural}!: Sequelize.BelongsToManyRemoveAssociationsMixin<${otherModel}, ${otherModel}Id>;\n`;
-          str += `${sp}has${otherModelSingular}!: Sequelize.BelongsToManyHasAssociationMixin<${otherModel}, ${otherModel}Id>;\n`;
-          str += `${sp}has${otherModelPlural}!: Sequelize.BelongsToManyHasAssociationsMixin<${otherModel}, ${otherModel}Id>;\n`;
-          str += `${sp}count${otherModelPlural}!: Sequelize.BelongsToManyCountAssociationsMixin;\n`;
-          needed[otherTable] ??= new Set();
-          needed[otherTable].add(otherModel);
-          needed[otherTable].add(`${otherModel}Id`);
-        }
-      }
-    });
-    if (needed[table]) {
-      delete needed[table]; // don't add import for self
-    }
-    return { needed, str };
-  }
-
-  private addTypeScriptFields(table: string, isInterface: boolean) {
+  private addTypeScriptFields(table: string, forFind: boolean) {
     const sp = this.space[1];
     const fields = _.keys(this.tables[table]);
-    const notNull = isInterface ? '' : '!';
     let str = '';
     fields.forEach(field => {
       const name = this.quoteName(recase(this.options.caseProp, field));
       const isOptional = this.getTypeScriptFieldOptional(table, field);
-      str += `${sp}${name}${isOptional ? '?' : notNull}: ${this.getTypeScriptType(table, field)};\n`;
+      const isAutoIncrement = this.getIsAutoIncrement(table, field);
+      let type = this.getTypeScriptType(table, field);
+      if (type === 'Date' && !forFind) {
+        type += ' | string';
+      }
+      str += `${sp}${name}${!forFind && (isOptional || isAutoIncrement) ? '?' : ''}: ${type};\n`;
     });
     return str;
   }
 
   private getTypeScriptFieldOptional(table: string, field: string) {
     const fieldObj = this.tables[table][field];
-    return fieldObj.allowNull || (fieldObj.defaultValue || fieldObj.defaultValue === "");
+    return fieldObj.allowNull || (fieldObj.defaultValue || fieldObj.defaultValue === "") || this.isTimestampField(field);
+  }
+
+  private getIsAutoIncrement(table: string, field: string) {
+    return this.tables[table][field].autoIncrement;
   }
 
   private getTypeScriptType(table: string, field: string) {
@@ -658,6 +602,8 @@ export class AutoGenerator {
     if (this.isArray(fieldType)) {
       const eltype = this.getTypeScriptFieldType(fieldObj, "elementType");
       jsType = eltype + '[]';
+    } else if (fieldObj.type === 'TINYINT(1)') {
+      jsType = 'boolean';
     } else if (this.isNumber(fieldType)) {
       jsType = 'number';
     } else if (this.isBoolean(fieldType)) {
@@ -669,6 +615,8 @@ export class AutoGenerator {
     } else if (this.isEnum(fieldType)) {
       const values = this.getEnumValues(fieldObj);
       jsType = values.join(' | ');
+    } else if (fieldType === 'json') {
+      jsType = 'JSONValue';
     } else {
       console.log(`Missing TypeScript type: ${fieldType || fieldObj['type']}`);
       jsType = 'any';

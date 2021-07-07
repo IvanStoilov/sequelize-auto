@@ -58,7 +58,7 @@ export class AutoWriter {
     // write the init-models file
     if (!this.options.noInitModels) {
       const initString = this.createInitString(tableNames, assoc, this.options.lang);
-      const initFilePath = path.join(this.options.directory, "init-models" + (isTypeScript ? '.ts' : '.js'));
+      const initFilePath = path.join(this.options.directory, "index" + (isTypeScript ? '.ts' : '.ts'));
       const writeFile = util.promisify(fs.writeFile);
       const initPromise = writeFile(path.resolve(initFilePath), initString);
       promises.push(initPromise);
@@ -67,22 +67,15 @@ export class AutoWriter {
     return Promise.all(promises);
   }
   private createInitString(tableNames: string[], assoc: string, lang?: string) {
-    switch (lang) {
-      case 'ts':
-        return this.createTsInitString(tableNames, assoc);
-      case 'esm':
-        return this.createESMInitString(tableNames, assoc);
-      default:
-        return this.createES5InitString(tableNames, assoc);
-    }
+    return this.createTsInitString(tableNames, assoc);
   }
   private createFile(table: string) {
     // FIXME: schema is not used to write the file name and there could be collisions. For now it
     // is up to the developer to pick the right schema, and potentially chose different output
     // folders for each different schema.
     const [schemaName, tableName] = qNameSplit(table);
-    const fileName = recase(this.options.caseFile, tableName, this.options.singularize);
-    const filePath = path.join(this.options.directory, fileName + (this.options.lang === 'ts' ? '.ts' : '.js'));
+    const fileName = recase(this.options.caseFile, tableName, this.options.singularize) + 'Model';
+    const filePath = path.join(this.options.directory, fileName + (this.options.lang === 'ts' ? '.ts' : '.ts'));
 
     const writeFile = util.promisify(fs.writeFile);
     return writeFile(path.resolve(filePath), this.tableText[table]);
@@ -114,46 +107,37 @@ export class AutoWriter {
 
   // create the TypeScript init-models file to load all the models into Sequelize
   private createTsInitString(tables: string[], assoc: string) {
-    let str = 'import type { Sequelize, Model } from "sequelize";\n';
+    let str = '';
     const modelNames: string[] = [];
     // import statements
     tables.forEach(t => {
       const fileName = recase(this.options.caseFile, t, this.options.singularize);
       const modelName = recase(this.options.caseModel, t, this.options.singularize);
       modelNames.push(modelName);
-      str += `import { ${modelName} } from "./${fileName}";\n`;
-      str += `import type { ${modelName}Attributes, ${modelName}CreationAttributes } from "./${fileName}";\n`;
+      str += `import { ${modelName}Model } from "./${fileName}Model";\n`;
     });
-    // re-export the model classes
-    str += '\nexport {\n';
+    str += '\nexport type ModelKey = \n';
     modelNames.forEach(m => {
-      str += `  ${m},\n`;
+      str += `  | '${m}'\n`;
+    });
+    str += ';\n';
+
+    // re-export the model classes
+    str += '\nexport const models = {\n';
+    modelNames.forEach(m => {
+      str += `  ${m}: ${m}Model,\n`;
     });
     str += '};\n';
-    // re-export the model attirbutes
-    str += '\nexport type {\n';
-    modelNames.forEach(m => {
-      str += `  ${m}Attributes,\n`;
-      str += `  ${m}CreationAttributes,\n`;
-    });
-    str += '};\n\n';
 
-    // create the initialization function
-    str += 'export function initModels(sequelize: Sequelize) {\n';
-    modelNames.forEach(m => {
-      str += `  ${m}.initModel(sequelize);\n`;
-    });
-
-    // add the asociations
-    str += "\n" + assoc;
-
-    // return the models
-    str += "\n  return {\n";
-    modelNames.forEach(m => {
-      str += `    ${m}: ${m},\n`;
-    });
-    str += '  };\n';
-    str += '}\n';
+    str += `
+// Init associations
+for (const model of Object.values(models)) {
+  const associate = model.options?.associate;
+  if (typeof associate === 'function') {
+    associate(models);
+  }
+}
+    `;
 
     return str;
   }
@@ -175,9 +159,6 @@ export class AutoWriter {
     modelNames.forEach(m => {
       str += `  var ${m} = _${m}(sequelize, DataTypes);\n`;
     });
-
-    // add the asociations
-    str += "\n" + assoc;
 
     // return the models
     str += "\n  return {\n";
