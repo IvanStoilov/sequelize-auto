@@ -1,6 +1,6 @@
 {
-  "name": "sequelize-auto",
-  "version": "0.8.3",
+  "name": "@proxyclick/sequelize-auto",
+  "version": "0.8.3-1",
   "publishConfig": {
     "tag": "latest"
   },
@@ -21,6 +21,7 @@
   "files": [
     "*.js",
     "lib/**/*.js",
+    "bin/*",
     "types/**/*.ts",
     "*.md"
   ],
